@@ -6,6 +6,18 @@
 
 算法目标：在无法一次拿到全量数据的前提下，用尽量少的翻页确认
 两站次数之和的前 K 名（同分按编号字典序），一旦名单和次序可确认就停。
+
+停读判定（每读完一页都做一次）：
+  榜单按 (次数降序, 编号字典序) 排列。设某站已读最后一页页末记录为
+  (e_count, e_id)，且该站还有未读页，则任何未读组合 c 在该站：
+    * 次数不超过 e_count；
+    * 若次数恰好等于 e_count，则编号 c 严格大于 e_id
+      （页末已是本页该次数层字典序最大的编号）。
+  站点已耗尽（无下一页）时，未读组合在该站次数确定为 0。
+  据此为每个“未在某站榜单出现过”的组合估计它在该站的最坏次数，
+  再求两站最坏总和；当第 K 名之外的所有组合（含完全陌生组合）在
+  最坏情况下都无法超越第 K 名、且前 K 名内部次序也不会被反超时，
+  名单与次序即确认，立即停翻，随后只用点查补齐入榜组合的分站次数。
 """
 from __future__ import annotations
 
@@ -40,19 +52,33 @@ class StationState:
     total_pages: Optional[int] = None
     # 已确定次数的组合（榜单页出现过，或点查确认过）-> 该站次数
     seen_counts: dict[str, int] = field(default_factory=dict)
-    # 已取最后一页中的最小次数，作为未取页的次数上界
-    last_page_min_count: Optional[int] = None
+    # 已读最后一页页末记录：(最小次数, 该次数层最大编号)
+    last_page_end: Optional[tuple[int, str]] = None
 
-    def unseen_upper_bound(self) -> Optional[int]:
-        """尚未翻到的组合在本站次数的上界（含）。
+    def has_bound(self) -> bool:
+        """是否已有可用的未读上界（至少读过一页，或已经耗尽）。"""
+        return self.exhausted or self.last_page_end is not None
 
-        榜单按次数降序排列，未取页里任何组合的次数都不超过
-        已取最后一页中的最小次数；站点已耗尽时上界为 0。
-        一页都没取时返回 None（尚无可用上界）。
+    def unseen_max_count(self, combo: Optional[str]) -> int:
+        """组合 combo 在本站“未读记录”中的最坏次数（含）。
+
+        combo 为 None 表示完全陌生的组合（编号未知，只做次数上界）。
+          * 已耗尽：未读组合次数确定为 0；
+          * 页末次数为 0：未读组合次数也只能是 0；
+          * 否则未读次数不超过页末次数 e_count；当 combo 编号已知且
+            不大于页末编号时，它不可能以 e_count 次出现在未读页，
+            最坏只能取 e_count - 1（编号字典序约束）。
         """
         if self.exhausted:
             return 0
-        return self.last_page_min_count
+        if self.last_page_end is None:
+            raise RuntimeError(f"站点 {self.name} 尚未取过任何页，无上界可用")
+        e_count, e_id = self.last_page_end
+        if e_count == 0:
+            return 0
+        if combo is not None and combo <= e_id:
+            return e_count - 1
+        return e_count
 
 
 def _fetch_rank(state: StationState, month: str) -> dict:
@@ -103,26 +129,61 @@ def _ordered_candidates(union: dict[str, dict]) -> list[tuple[str, int]]:
     )
 
 
-def _cannot_overtake(
+def _worst_total(
     combo: Optional[str],
-    worst_sum: int,
-    top_k: list[tuple[str, int]],
-) -> bool:
-    """判断最坏情况下的某个组合是否确定无法进入当前前 K 名。
+    union: dict[str, dict],
+    states: dict[str, StationState],
+) -> int:
+    """组合 combo 在所有未读记录都取最坏值时的两站总和上界。
 
-    排序键为 (总和降序, 编号字典序)。无法超越当且仅当：
-      * 最坏总和严格小于第 K 名总和；或
-      * 最坏总和等于第 K 名总和，且其编号字典序严格大于第 K 名编号
-        （陌生组合没有确定编号，同分时必须保守判定为可能超越）。
+    combo 为 None 表示陌生组合（无任何已确定次数，编号未知）。
     """
-    kth_combo, kth_sum = top_k[-1]
-    if worst_sum < kth_sum:
+    worst = 0
+    for state in states.values():
+        if combo is not None and combo in state.seen_counts:
+            worst += state.seen_counts[combo]  # 该站次数已由榜单/点查确定
+        else:
+            worst += state.unseen_max_count(combo)
+    return worst
+
+
+def _stranger_cannot_overtake(
+    kth_combo: str,
+    kth_sum: int,
+    states: dict[str, StationState],
+) -> bool:
+    """判断完全陌生的组合是否确定无法超越第 K 名。
+
+    陌生组合没有任何已确定次数，最坏总和 W = Σ 各站未读最坏次数。
+      * W < 第 K 名总和：确定无法超越；
+      * W > 第 K 名总和：可能超越；
+      * W 相等：只有当它能以“编号字典序小于第 K 名”的身份取到 W 时
+        才能超越。各非耗尽且页末次数 > 0 的站点都会约束其编号严格
+        大于该站页末编号；若这些约束下不存在小于第 K 名编号的可能，
+        则确定无法超越。站点耗尽或页末次数为 0 时不贡献次数，
+        也不产生编号约束。
+    """
+    worst = 0
+    constrained_ends: list[str] = []
+    for state in states.values():
+        if state.exhausted or state.last_page_end is None:
+            continue
+        e_count, e_id = state.last_page_end
+        if e_count > 0:
+            worst += e_count
+            constrained_ends.append(e_id)
+    if worst < kth_sum:
         return True
-    if worst_sum > kth_sum:
+    if worst > kth_sum:
         return False
-    if combo is None:
-        return False  # 陌生组合可能携带字典序更小的编号
-    return combo > kth_combo
+    if not constrained_ends:
+        # W 等于第 K 名总和却没有任何编号约束（所有贡献都是 0）：
+        # 陌生组合可能携带更小的编号，必须保守判定为可能超越
+        return False
+    # 陌生组合编号必须严格大于每个贡献正次数站点的页末编号，
+    # 即 > max(页末编号)；若该下界已不小于第 K 名编号，则不存在
+    # 字典序更小的可行编号，无法在同分中反超
+    return max(constrained_ends) >= kth_combo
 
 
 def _bound_allows_stop(
@@ -131,51 +192,42 @@ def _bound_allows_stop(
     """仅依据榜单页数据，检查 Top-K 的名单与次序是否已经可以确认。
 
     可以确认则返回候选前 K 名 [(combo, total), ...]，否则返回 None。
-
-    判定原理：对任意“已见”组合 c，它在每一站的真实次数要么已经在
-    榜单页里确定，要么（该站榜单还没翻到它）不超过该站未取页上界 b_s。
-    因此 c 的最坏情况总和 W(c) = 已确定站的真实值 + 未确定站的上界；
-    完全没出现过的陌生组合最坏为 Σ_s b_s 且编号未知。当前 K 名之外
-    的所有组合（含陌生组合）都确定无法超越第 K 名时即可停读，
-    随后再用点查把前 K 名每站次数精确化。
-    任一站还没取首页时 b_s 未知（None），不能停。
+    任一站还没取首页时没有可用上界，不能停。
     """
-    bounds = {name: s.unseen_upper_bound() for name, s in states.items()}
-    if any(b is None for b in bounds.values()):
+    if not all(s.has_bound() for s in states.values()):
         return None
 
     ordered = _ordered_candidates(union)
+    if not ordered:
+        # 两站至少各读过一页仍无任何登记组合：整体候选集为空
+        return []
     if len(ordered) < k:
-        return None
+        if not all(s.exhausted for s in states.values()):
+            # 未读页里可能还有新组合，候选总数未定，不能提前收尾
+            return None
+        # 两站全部耗尽仍不足 K 个：数据本身就这么多，全部按规则返回
+        return ordered
     top_k = ordered[:k]
 
     # 前 K 内部次序也必须已经确定：相邻两名 i、i+1，即使 i+1 在所有
-    # 未确定站都取到上界、i 都取 0，i 仍不能被反超（含同分字典序）。
+    # 未确定站都取到最坏值、i 保持已确定值，i 仍不能被反超（含同分
+    # 字典序）。相邻对都稳定则整张前 K 榜的次序稳定
     for idx in range(len(top_k) - 1):
         hi_combo, _ = top_k[idx]
         lo_combo, _ = top_k[idx + 1]
-        lo_worst = 0
-        for name, state in states.items():
-            if lo_combo in state.seen_counts:
-                lo_worst += state.seen_counts[lo_combo]
-            else:
-                lo_worst += bounds[name]  # type: ignore[operator]
+        lo_worst = _worst_total(lo_combo, union, states)
         hi_known = union[hi_combo]["sum"]
         if lo_worst > hi_known or (lo_worst == hi_known and lo_combo < hi_combo):
             return None
 
-    stranger_worst = sum(b for b in bounds.values() if b is not None)
-    if not _cannot_overtake(None, stranger_worst, top_k):
+    kth_combo, kth_sum = top_k[-1]
+    if not _stranger_cannot_overtake(kth_combo, kth_sum, states):
         return None
 
+    # 第 K 名之外的已见组合：逐个用含页末编号约束的最坏总和判断
     for combo, _ in ordered[k:]:
-        worst = 0
-        for name, state in states.items():
-            if combo in state.seen_counts:
-                worst += state.seen_counts[combo]  # 该站次数已确定
-            else:
-                worst += bounds[name]  # type: ignore[operator]  # 未取页上界
-        if not _cannot_overtake(combo, worst, top_k):
+        worst = _worst_total(combo, union, states)
+        if worst > kth_sum or (worst == kth_sum and combo < kth_combo):
             return None
     return top_k
 
@@ -233,14 +285,19 @@ def top_k(
     station_names = list(stations.keys())
 
     def ingest_page(state: StationState, items: list[dict]) -> None:
-        page_min_count: Optional[int] = None
+        if not items:
+            # 空页不改变既有页末上界；调用方会据此把站点标记为耗尽
+            return
+        min_count = min(int(item["count"]) for item in items)
+        # 页末编号 = 最小次数层里字典序最大的编号
+        end_id = max(
+            str(item["combo_id"])
+            for item in items
+            if int(item["count"]) == min_count
+        )
         for item in items:
-            combo = str(item["combo_id"])
-            cnt = int(item["count"])
-            state.seen_counts[combo] = cnt
-            if page_min_count is None or cnt < page_min_count:
-                page_min_count = cnt
-        state.last_page_min_count = page_min_count
+            state.seen_counts[str(item["combo_id"])] = int(item["count"])
+        state.last_page_end = (min_count, end_id)
 
     # 两站轮流翻页，每取完一页就检查能否确认；确认成功立即停止
     while True:
@@ -248,14 +305,16 @@ def top_k(
         union = _rebuild_union(states)
         candidate_top = _bound_allows_stop(union, states, k)
         if candidate_top is not None:
+            # 无论候选是否满 K 个，结果都不得超过 K 条
             results = _resolve_top_k_counts(
-                candidate_top, states, month, count_queries
+                candidate_top[:k], states, month, count_queries
             )
             break
 
         if all(s.exhausted for s in states.values()):
-            # 两站全部翻完仍不足 K 个：数据本身就这么多，全部按规则返回
-            all_ordered = _ordered_candidates(union)
+            # 兜底：两站全部翻完仍无法经由常规判定确认（理论上不会发生，
+            # 因为耗尽后所有次数均已确定）。同样只取前 K，绝不列出整榜
+            all_ordered = _ordered_candidates(union)[:k]
             results = _resolve_top_k_counts(
                 all_ordered, states, month, count_queries
             )
@@ -286,7 +345,7 @@ def top_k(
             candidate_top = _bound_allows_stop(_rebuild_union(states), states, k)
             if candidate_top is not None:
                 results = _resolve_top_k_counts(
-                    candidate_top, states, month, count_queries
+                    candidate_top[:k], states, month, count_queries
                 )
                 break
         else:

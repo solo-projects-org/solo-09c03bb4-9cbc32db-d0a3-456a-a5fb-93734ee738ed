@@ -14,7 +14,9 @@
   4. 场景二 2026-02 K=3：首屏后即停（各 1 页）；
   5. 2026-04 K=1：未耗尽站点通过点查确认缺号零；
   6. 同分按编号字典序（2026-03）；
-  7. 失败隔离：指向不可达地址时只提示出错站点。
+  7. 全零月报 2026-05：零次组合参榜但结果最多 K 条；
+  8. 同分利用页末编号首屏即停（2026-06）；未读同分仍可能入榜时续翻（2026-07）；
+  9. 失败隔离：指向不可达地址时只提示出错站点。
 """
 from __future__ import annotations
 
@@ -114,6 +116,36 @@ def main() -> int:
     check("同分字典序 T01<T02<T03",
           [r[1] for r in rows[:3]] == ["T01", "T02", "T03"], str([r[1] for r in rows]))
 
+    # 7. 全零月报：零次组合照常参榜，但结果最多 K 条（回归：旧实现列出整榜）
+    rows, pages, cq = query("2026-05", 3)
+    check("全零月报 只返回K条", len(rows) == 3, str([r[1] for r in rows]))
+    check("全零月报 字典序前3",
+          [r[1] for r in rows] == ["Z01", "Z02", "Z03"], str([r[1] for r in rows]))
+    check("全零月报 总和全为0", all(r[4] == "0" for r in rows), str(rows))
+    check("全零月报 零次点查", "维修站A 0 次" in cq and "维修站B 0 次" in cq, cq)
+    rows_big, _, _ = query("2026-05", 20)
+    check("全零月报 K大于总数全列", len(rows_big) == 10, str(len(rows_big)))
+
+    # 8a. 同分可停：陌生组合最坏同分但页末编号更大，首屏即停（各 1 页）
+    rows, pages, cq = query("2026-06", 3)
+    check("同分可停 名单次序",
+          [r[1] for r in rows] == ["H1", "H2", "D03"], str([r[1] for r in rows]))
+    check("同分可停 首屏即停(各1页)",
+          "维修站A 1 页" in pages and "维修站B 1 页" in pages, pages)
+
+    # 8b. 同分不能停：未读 C01 两站各 5 次且编号更小，两站都须翻第 2 页
+    rows, pages, cq = query("2026-07", 3)
+    check("同分续翻 未读C01入榜",
+          [r[1] for r in rows] == ["H1", "H2", "C01"], str([r[1] for r in rows]))
+    check("同分续翻 两站各翻2页",
+          "维修站A 2 页" in pages and "维修站B 2 页" in pages, pages)
+
+    # 通用不变量：任何查询结果行数都不超过 K
+    for month, k in (("2026-01", 3), ("2026-03", 5), ("2026-05", 3),
+                     ("2026-06", 3), ("2026-07", 3)):
+        rows, _pages, _cq = query(month, k)
+        check(f"结果不超过K条({month} K={k})", len(rows) <= k, str(len(rows)))
+
     # 7. 失败隔离：临时起一个把 B 站指向不可达端口的 web 实例，
     #    页面只能提示出错站点（维修站B），且不出现任何结果表格。
     free = socket.socket()
@@ -124,7 +156,7 @@ def main() -> int:
     web_dir = Path(__file__).resolve().parent.parent / "web"
     env = dict(os.environ)
     env.update({
-        "AVAILABLE_MONTHS": "2026-01,2026-02,2026-03,2026-04",
+        "AVAILABLE_MONTHS": "2026-01,2026-02,2026-03,2026-04,2026-05,2026-06,2026-07",
         "STATION_A_URL": args.station_a,
         "STATION_B_URL": f"http://127.0.0.1:{dead_port}",
         "PORT": str(probe_port),
@@ -152,7 +184,7 @@ def main() -> int:
         except subprocess.TimeoutExpired:
             proc.kill()
 
-    # 8. 参数校验：非法 K 只显示错误、不渲染结果表
+    # 9. 参数校验：非法 K 只显示错误、不渲染结果表
     bad = get_text(f"{args.web}/query?month=2026-02&k=0")
     check("非法K显示错误且无结果表", 'class="error"' in bad and "<tbody>" not in bad)
 
